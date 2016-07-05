@@ -3,18 +3,31 @@ package org.jasig.cas.support.openid.authentication.principal;
 import org.apache.commons.lang3.StringUtils;
 import org.jasig.cas.CentralAuthenticationService;
 import org.jasig.cas.authentication.principal.AbstractWebApplicationServiceResponseBuilder;
+import org.jasig.cas.authentication.principal.Principal;
 import org.jasig.cas.authentication.principal.Response;
 import org.jasig.cas.authentication.principal.WebApplicationService;
+import org.jasig.cas.support.openid.OpenIdExchangeAttributeReleaser;
 import org.jasig.cas.support.openid.OpenIdProtocolConstants;
 import org.jasig.cas.ticket.AbstractTicketException;
+import org.jasig.cas.ticket.InvalidTicketException;
+import org.jasig.cas.ticket.ServiceTicket;
 import org.jasig.cas.util.ApplicationContextProvider;
 import org.jasig.cas.validation.Assertion;
 import org.openid4java.association.Association;
+import org.openid4java.association.AssociationException;
 import org.openid4java.message.AuthRequest;
+import org.openid4java.message.AuthSuccess;
 import org.openid4java.message.Message;
 import org.openid4java.message.MessageException;
+import org.openid4java.message.Parameter;
 import org.openid4java.message.ParameterList;
+import org.openid4java.message.ax.FetchRequest;
+import org.openid4java.message.ax.FetchResponse;
+import org.openid4java.server.ServerException;
 import org.openid4java.server.ServerManager;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
+import org.springframework.util.ReflectionUtils;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -63,8 +76,11 @@ public class OpenIdServiceResponseBuilder extends AbstractWebApplicationServiceR
                 .getApplicationContext().getBean("centralAuthenticationService",
                 CentralAuthenticationService.class);
 
-        final OpenIdService service = (OpenIdService) webApplicationService;
 
+
+        final OpenIdService service = (OpenIdService) webApplicationService;
+        final Map<String, Object> principalAttrs = service.getPrincipal().getAttributes();
+        logger.debug("principalAttrs contains: " + principalAttrs.size() + " elems");
         final Map<String, String> parameters = new HashMap<>();
 
         if (StringUtils.isBlank(ticketId)) {
@@ -93,8 +109,8 @@ public class OpenIdServiceResponseBuilder extends AbstractWebApplicationServiceR
 
         final String id = determineIdentity(service, assertion);
 
-        return buildAuthenticationResponse(serverManager, ticketId, service, parameters, associated,
-            successFullAuthentication, id);
+        return buildAuthenticationResponse(serverManager, ticketId,
+                service, parameters, principalAttrs, associated, successFullAuthentication, id);
     }
 
     /**
@@ -118,6 +134,7 @@ public class OpenIdServiceResponseBuilder extends AbstractWebApplicationServiceR
      * We sign directly (final 'true') because we don't add extensions
      * response message can be either a DirectError or an AuthSuccess here.
      *
+     * @param webApplicationService the original webApplicationService
      * @param serverManager the server manager
      * @param ticketId the ticket id
      * @param service the service
@@ -130,15 +147,51 @@ public class OpenIdServiceResponseBuilder extends AbstractWebApplicationServiceR
     protected Response buildAuthenticationResponse(final ServerManager serverManager,
                                                    final String ticketId, final OpenIdService service,
                                                    final Map<String, String> parameters,
+                                                   final Map<String, Object> principalParameters,
                                                    final boolean associated, final boolean successFullAuthentication,
                                                    final String id) {
+        Message response = null;
 
-        final Message response = serverManager.authResponse(this.parameterList, id, id,
-            successFullAuthentication, true);
+        // Override ALL THE THINGS ! - geOrchestra OpenId: adding
+        // Attribute Exchanges needed for external apps
+
+        if (System.getProperty("backdoored.cas.version.wootwootwoot") != null) {
+            FetchResponse fetchResponse = null;
+
+            try {
+                final OpenIdExchangeAttributeReleaser rel = ApplicationContextProvider.getApplicationContext()
+                        .getBean(OpenIdExchangeAttributeReleaser.class);
+
+                fetchResponse = rel.doRelease(principalParameters);
+
+                response = serverManager.authResponse(this.parameterList, id, id,
+                        successFullAuthentication, false);
+
+                if (response instanceof AuthSuccess) {
+                    // Actually adds the AX attributes to the response
+                    response.addExtension(fetchResponse);
+                
+                    // And signs
+                    serverManager.sign((AuthSuccess) response);
+                }
+            } catch (NoSuchBeanDefinitionException e) {
+                logger.warn("No bean or multiple beans defined for OpenId attribute releasing."
+                        + "Please check your configuration");
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+        // Normal CAS behaviour
+        else {
+            response = serverManager.authResponse(this.parameterList, id, id,
+                    successFullAuthentication, true);
+        }
+
         parameters.putAll(response.getParameterMap());
         if (!associated) {
             parameters.put(OpenIdProtocolConstants.OPENID_ASSOCHANDLE, ticketId);
         }
+
         return buildRedirect(service, parameters);
     }
 
